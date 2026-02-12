@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Text;
+using System.Threading; // Added for SemaphoreSlim
 using System.Threading.Tasks;
 using Azure;
 using Azure.AI.OpenAI;
@@ -37,11 +38,10 @@ namespace AiDocGenerator
             if (string.IsNullOrEmpty(endpoint) || string.IsNullOrEmpty(apiKey) || apiKey == "YOUR_KEY_HERE")
             {
                 Console.WriteLine("ERROR: Please configure your Azure OpenAI settings in appsettings.json");
-                Console.WriteLine("Make sure to set AzureOpenAI:Endpoint, AzureOpenAI:ApiKey, and AzureOpenAI:DeploymentName");
                 return;
             }
 
-            // Load source code from file or use default example
+            // Load source code
             string sourceCode;
             if (File.Exists(inputFile))
             {
@@ -51,28 +51,7 @@ namespace AiDocGenerator
             else
             {
                 Console.WriteLine($"File {inputFile} not found. Using example code...");
-                sourceCode = @"
-using System;
-namespace DemoApp
-{
-    public class Calculator
-    {
-        public int Add(int a, int b)
-        {
-            return a + b;
-        }
-
-        /// <summary>
-        /// Existing documentation should be ignored.
-        /// </summary>
-        public void PrintResult(int result)
-        {
-            Console.WriteLine(result);
-        }
-
-        public double Divide(double a, double b) => a / b;
-    }
-}";
+                sourceCode = GetExampleCode();
             }
 
             Console.WriteLine("\n--- Analyzing Code ---");
@@ -109,28 +88,43 @@ namespace DemoApp
 
             Console.WriteLine($"Found {collector.Targets.Count} undocumented items. Generating docs...");
 
-            // 4. Generate Documentation in Parallel
+            // 4. Generate Documentation with Throttling (Avoids Rate Limits)
             var openAiClient = new OpenAIClient(new Uri(endpoint), new AzureKeyCredential(apiKey));
-            var docMap = new ConcurrentDictionary<SyntaxNode, string>();
-
+            
+            // Key = Node.SpanStart (Int position), Value = Generated XML
+            // We use SpanStart because SyntaxNode references change during rewriting.
+            var docMap = new Dictionary<int, string>(); 
+            
+            int maxConcurrent = 3; // Limit to 3 concurrent requests to avoid 429 errors
+            var semaphore = new SemaphoreSlim(maxConcurrent);
+            
             var tasks = collector.Targets.Select(async node =>
             {
+                await semaphore.WaitAsync();
                 try
                 {
                     // Extract just the signature and body for the AI context
                     string snippet = node.ToString();
                     
-                    // Use Semantic Model to get the full symbol name (helpful for the AI to know context)
+                    // Use Semantic Model to get the full symbol name
                     var symbol = semanticModel.GetDeclaredSymbol(node);
                     string symbolName = symbol?.ToDisplayString() ?? "Unknown";
 
                     string generatedDoc = await GenerateDocWithOpenAi(openAiClient, deploymentName, symbolName, snippet);
-                    docMap.TryAdd(node, generatedDoc);
+                    
+                    lock (docMap)
+                    {
+                        docMap[node.SpanStart] = generatedDoc;
+                    }
                     Console.WriteLine($"✓ Generated docs for: {symbolName}");
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"✗ Error generating docs for {node}: {ex.Message}");
+                    Console.WriteLine($"✗ Error generating docs for {node.SpanStart}: {ex.Message}");
+                }
+                finally
+                {
+                    semaphore.Release();
                 }
             });
 
@@ -168,9 +162,35 @@ namespace DemoApp
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"AI Error for {contextName}: {ex.Message}");
-                return $"/// <summary>\n/// Documentation generation failed: {ex.Message}\n/// </summary>\n";
+                // Simple retry or error reporting logic could go here
+                throw; 
             }
+        }
+
+        private static string GetExampleCode()
+        {
+            return @"
+using System;
+namespace DemoApp
+{
+    public class Calculator
+    {
+        public int Add(int a, int b)
+        {
+            return a + b;
+        }
+
+        /// <summary>
+        /// Existing documentation should be ignored.
+        /// </summary>
+        public void PrintResult(int result)
+        {
+            Console.WriteLine(result);
+        }
+
+        public double Divide(double a, double b) => a / b;
+    }
+}";
         }
     }
 
@@ -205,45 +225,82 @@ namespace DemoApp
 
     /// <summary>
     /// Rewrites the tree by inserting the generated documentation.
+    /// Uses Position-Based matching and Bottom-Up rewriting.
     /// </summary>
     class DocRewriter : CSharpSyntaxRewriter
     {
-        private readonly IDictionary<SyntaxNode, string> _docs;
+        private readonly IDictionary<int, string> _docs;
 
-        public DocRewriter(IDictionary<SyntaxNode, string> docs)
+        public DocRewriter(IDictionary<int, string> docs)
         {
             _docs = docs;
         }
 
-        public override SyntaxNode Visit(SyntaxNode node)
+        private SyntaxNode AddDocumentation(SyntaxNode node, string docXml)
         {
-            // If this node is in our map, add the docs
-            if (node != null && _docs.TryGetValue(node, out var docXml))
+            // Get existing leading trivia (indentation, comments, etc.)
+            var existingTrivia = node.GetLeadingTrivia();
+            
+            // Find the last whitespace trivia to determine indentation
+            var whitespace = existingTrivia.LastOrDefault(t => t.IsKind(SyntaxKind.WhitespaceTrivia));
+            var indentText = whitespace.ToString();
+            
+            if (string.IsNullOrEmpty(indentText))
             {
-                // Get existing leading trivia (indentation, etc.)
-                var existingTrivia = node.GetLeadingTrivia();
-                
-                // Find the indentation from existing trivia
-                var indentation = existingTrivia.LastOrDefault(t => t.IsKind(SyntaxKind.WhitespaceTrivia));
-                
-                // If no indentation found, try to infer from parent or use default
-                if (indentation == default(SyntaxTrivia))
-                {
-                    // Default to 4 spaces if we can't find existing indentation
-                    indentation = SyntaxFactory.Whitespace("    ");
-                }
-                
-                // Parse the XML documentation into trivia
-                var docTrivia = SyntaxFactory.ParseLeadingTrivia(docXml);
-                
-                // Combine: documentation + indentation + any other existing trivia
-                var newTrivia = docTrivia.Add(indentation);
-
-                // Update the node with new leading trivia
-                return base.Visit(node.WithLeadingTrivia(newTrivia));
+                indentText = "    "; // Default 4 spaces
             }
 
-            return base.Visit(node);
+            // Split the generated XML into lines so we can indent each line correctly
+            var docLines = docXml.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None);
+            
+            // Reassemble with correct indentation
+            var indentedDocBuilder = new StringBuilder();
+            foreach (var line in docLines)
+            {
+                if (!string.IsNullOrWhiteSpace(line))
+                {
+                    indentedDocBuilder.AppendLine(indentText + line.TrimStart());
+                }
+            }
+            
+            // Parse the correctly indented XML into Trivia
+            var docTrivia = SyntaxFactory.ParseLeadingTrivia(indentedDocBuilder.ToString());
+            
+            // Combine: Existing Trivia + New Docs
+            // We append the new docs to the end of the existing trivia list
+            // (e.g. after any #region directives but before the node itself)
+            var newTrivia = existingTrivia.AddRange(docTrivia);
+
+            return node.WithLeadingTrivia(newTrivia);
+        }
+
+        public override SyntaxNode VisitClassDeclaration(ClassDeclarationSyntax node)
+        {
+            // 1. Visit children (Methods) FIRST.
+            // This ensures we rewrite the inner methods before processing the class itself.
+            var rewrittenNode = (ClassDeclarationSyntax)base.VisitClassDeclaration(node)!;
+
+            // 2. Check if THIS class (using original SpanStart) has documentation to add.
+            if (_docs.TryGetValue(node.SpanStart, out var docXml))
+            {
+                return AddDocumentation(rewrittenNode, docXml);
+            }
+
+            return rewrittenNode;
+        }
+
+        public override SyntaxNode VisitMethodDeclaration(MethodDeclarationSyntax node)
+        {
+            // 1. Visit children FIRST.
+            var rewrittenNode = (MethodDeclarationSyntax)base.VisitMethodDeclaration(node)!;
+
+            // 2. Check if THIS method (using original SpanStart) has documentation to add.
+            if (_docs.TryGetValue(node.SpanStart, out var docXml))
+            {
+                return AddDocumentation(rewrittenNode, docXml);
+            }
+
+            return rewrittenNode;
         }
     }
 }
