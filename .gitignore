@@ -1,0 +1,28 @@
+# Build results
+bin/
+obj/
+*.dll
+*.exe
+*.pdb
+
+# User-specific files
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Configuration files with secrets
+appsettings.json
+appsettings.*.json
+
+# IDE files
+.vs/
+.idea/
+*.swp
+*.swo
+*~
+
+# Output files
+output.cs
+input.cs
+
